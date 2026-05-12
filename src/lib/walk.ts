@@ -1,9 +1,9 @@
-import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { join, relative, resolve, sep } from 'node:path';
 import picomatch from 'picomatch';
 
-const DEFAULT_IGNORES = [
+const DEFAULT_EXCLUDES = [
   'node_modules/',
   'dist/',
   'build/',
@@ -13,14 +13,23 @@ const DEFAULT_IGNORES = [
   '.compass/',
 ];
 
-const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
+const ALWAYS_SKIP_DIRS = new Set(['.git', '.compass']);
 
-export interface IgnoreRules {
+const SOURCE_EXTENSIONS = new Set([
+  '.ts',
+  '.tsx',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+]);
+
+interface ParsedIgnore {
   excludes: string[];
-  reincludes: string[]; // patterns starting with `!`
+  reincludes: string[];
 }
 
-function parseIgnoreFile(text: string): IgnoreRules {
+function parseIgnore(text: string): ParsedIgnore {
   const excludes: string[] = [];
   const reincludes: string[] = [];
   for (const raw of text.split('\n')) {
@@ -32,76 +41,139 @@ function parseIgnoreFile(text: string): IgnoreRules {
   return { excludes, reincludes };
 }
 
-export function loadIgnoreRules(root: string): IgnoreRules {
-  const compassIgnore = join(root, '.compassignore');
-  const gitIgnore = join(root, '.gitignore');
+function normalizePattern(p: string): string[] {
+  let pat = p.trim();
+  if (!pat) return [];
+  const anchored = pat.startsWith('/');
+  if (anchored) pat = pat.slice(1);
+  // Trailing slash → match dir and everything under it.
+  const dirOnly = pat.endsWith('/');
+  if (dirOnly) pat = pat.slice(0, -1);
 
-  let excludes: string[] = [];
-  let reincludes: string[] = [];
+  const containsSlash = pat.includes('/');
+  const containsGlob = /[*?[]/.test(pat);
 
-  if (existsSync(gitIgnore)) {
-    const r = parseIgnoreFile(readFileSync(gitIgnore, 'utf8'));
-    excludes.push(...r.excludes);
-    // .gitignore `!` re-includes are not given compass-override status; only
-    // .compassignore's `!` re-includes override.
-  }
-  if (existsSync(compassIgnore)) {
-    const r = parseIgnoreFile(readFileSync(compassIgnore, 'utf8'));
-    excludes.push(...r.excludes);
-    reincludes.push(...r.reincludes);
+  const out: string[] = [];
+  if (!containsSlash) {
+    // A bare name (file or dir) matches anywhere in the tree.
+    if (dirOnly) {
+      out.push(`**/${pat}`);
+      out.push(`**/${pat}/**`);
+    } else if (containsGlob) {
+      out.push(`**/${pat}`);
+    } else {
+      out.push(`**/${pat}`);
+      out.push(`**/${pat}/**`);
+    }
   } else {
-    // No .compassignore — fall back to defaults union'd with .gitignore.
-    excludes.push(...DEFAULT_IGNORES);
+    out.push(pat);
+    if (dirOnly) out.push(`${pat}/**`);
   }
-
-  return { excludes, reincludes };
+  return out;
 }
 
-function normalizePattern(p: string): string {
-  // Treat a trailing slash as "match everything under this directory".
-  if (p.endsWith('/')) return `${p.slice(0, -1)}/**`;
-  // Bare directory name → match dir + contents.
-  if (!p.includes('/') && !p.includes('*')) return `**/${p}/**`;
-  return p;
+interface CompiledRules {
+  excludes: ((p: string) => boolean)[];
+  reincludes: ((p: string) => boolean)[];
+  reincludeRoots: string[]; // path prefixes we must descend into to evaluate reincludes
 }
 
-export function makeMatcher(rules: IgnoreRules) {
-  const excludePatterns = rules.excludes.map(normalizePattern);
-  const reincludePatterns = rules.reincludes.map(normalizePattern);
-  const excludeMatchers = excludePatterns.map((p) => picomatch(p, { dot: true }));
-  const reincludeMatchers = reincludePatterns.map((p) => picomatch(p, { dot: true }));
-  return (relPath: string) => {
-    const path = relPath.split(sep).join('/');
-    // Reinclude wins (covers the !path override in the precedence table).
-    if (reincludeMatchers.some((m) => m(path))) return { excluded: false };
-    if (excludeMatchers.some((m) => m(path))) return { excluded: true };
-    return { excluded: false };
+function compile(rules: ParsedIgnore): CompiledRules {
+  const compileOne = (p: string) =>
+    normalizePattern(p).map((pat) => picomatch(pat, { dot: true }));
+  const flatten = (arr: string[]) => arr.flatMap(compileOne);
+  // For every !-re-include pattern, capture the literal directory prefix that
+  // we'll need to descend into. e.g. `!vendor/keepme/` → ['vendor', 'vendor/keepme'].
+  const roots = new Set<string>();
+  for (const p of rules.reincludes) {
+    let pat = p.trim();
+    if (pat.startsWith('/')) pat = pat.slice(1);
+    if (pat.endsWith('/')) pat = pat.slice(0, -1);
+    // Only the literal parts; stop at the first glob meta-char.
+    const parts: string[] = [];
+    for (const seg of pat.split('/')) {
+      if (/[*?[]/.test(seg)) break;
+      if (seg.length > 0) parts.push(seg);
+    }
+    for (let i = 1; i <= parts.length; i++) {
+      roots.add(parts.slice(0, i).join('/'));
+    }
+  }
+  return {
+    excludes: flatten(rules.excludes),
+    reincludes: flatten(rules.reincludes),
+    reincludeRoots: Array.from(roots),
   };
 }
 
-export interface WalkResult {
-  files: { rel: string; abs: string; sha256: string; mtime: string }[];
-  skipped_ignore: number;
+function loadRules(root: string): CompiledRules {
+  const compassIgnorePath = join(root, '.compassignore');
+  const gitIgnorePath = join(root, '.gitignore');
+
+  const hasCompass = existsSync(compassIgnorePath);
+  const compass = hasCompass
+    ? parseIgnore(readFileSync(compassIgnorePath, 'utf8'))
+    : { excludes: [...DEFAULT_EXCLUDES], reincludes: [] as string[] };
+
+  const git: ParsedIgnore = existsSync(gitIgnorePath)
+    ? parseIgnore(readFileSync(gitIgnorePath, 'utf8'))
+    : { excludes: [], reincludes: [] };
+
+  // Per SPEC §5.3 precedence: union of excludes, with .compassignore's `!include`
+  // overriding either source.
+  return compile({
+    excludes: [...git.excludes, ...compass.excludes],
+    reincludes: compass.reincludes,
+  });
 }
 
-export function isSourceFile(name: string): boolean {
+function isSourceFile(name: string): boolean {
   const lower = name.toLowerCase();
+  if (lower.endsWith('.d.ts')) return false;
   for (const ext of SOURCE_EXTENSIONS) {
     if (lower.endsWith(ext)) return true;
   }
   return false;
 }
 
-export function sha256OfFile(abs: string): string {
-  const buf = readFileSync(abs);
-  return createHash('sha256').update(buf).digest('hex');
+function isExcluded(relPath: string, isDir: boolean, rules: CompiledRules): boolean {
+  // Normalize for picomatch: posix separators.
+  const pPath = relPath.split(sep).join('/');
+  const candidates = isDir ? [pPath, `${pPath}/`] : [pPath];
+
+  // `!`-re-includes override exclusions, regardless of source.
+  for (const c of candidates) {
+    if (rules.reincludes.some((m) => m(c))) return false;
+  }
+  for (const c of candidates) {
+    if (rules.excludes.some((m) => m(c))) return true;
+  }
+  return false;
 }
 
-export function walkRepo(root: string): WalkResult {
-  const rules = loadIgnoreRules(root);
-  const matcher = makeMatcher(rules);
-  const files: WalkResult['files'] = [];
-  let skipped = 0;
+/**
+ * When a directory is excluded but a re-include pattern targets something under
+ * it, we must still descend in order to evaluate that override. Mirrors
+ * gitignore behavior for `dir/` + `!dir/keep/`.
+ */
+function mustDescend(relPath: string, rules: CompiledRules): boolean {
+  const p = relPath.split(sep).join('/');
+  for (const root of rules.reincludeRoots) {
+    if (root === p) return true;
+    if (root.startsWith(p + '/')) return true;
+    if (p.startsWith(root + '/')) return true;
+  }
+  return false;
+}
+
+/**
+ * Walk the repo and return absolute paths of all kept source files.
+ * SPEC §5.3 / §6.1 step 4: respects .compassignore + .gitignore precedence.
+ */
+export function walk(root: string): string[] {
+  const absRoot = resolve(root);
+  const rules = loadRules(absRoot);
+  const out: string[] = [];
 
   function recur(dir: string) {
     let entries;
@@ -112,26 +184,38 @@ export function walkRepo(root: string): WalkResult {
     }
     for (const entry of entries) {
       const abs = join(dir, entry.name);
-      const rel = relative(root, abs);
-      const { excluded } = matcher(rel + (entry.isDirectory() ? '/' : ''));
-      if (excluded) {
-        skipped += 1;
+      const rel = relative(absRoot, abs);
+      // Refuse to follow symlinks (security: prevent escape outside root).
+      let stat;
+      try {
+        stat = lstatSync(abs);
+      } catch {
         continue;
       }
+      if (stat.isSymbolicLink()) continue;
+
       if (entry.isDirectory()) {
+        if (ALWAYS_SKIP_DIRS.has(entry.name)) continue;
+        const excluded = isExcluded(rel, true, rules);
+        if (excluded && !mustDescend(rel, rules)) continue;
         recur(abs);
-      } else if (entry.isFile() && isSourceFile(entry.name)) {
-        const st = statSync(abs);
-        files.push({
-          rel,
-          abs,
-          sha256: sha256OfFile(abs),
-          mtime: st.mtime.toISOString(),
-        });
+      } else if (entry.isFile()) {
+        if (!isSourceFile(entry.name)) continue;
+        if (isExcluded(rel, false, rules)) continue;
+        out.push(abs);
       }
     }
   }
 
-  recur(root);
-  return { files, skipped_ignore: skipped };
+  recur(absRoot);
+  return out;
+}
+
+/**
+ * SHA256 hex of file contents. Streams via readFileSync (Node handles the
+ * buffering internally; 5MB is well within bounds).
+ */
+export function hashFile(path: string): string {
+  const buf = readFileSync(path);
+  return createHash('sha256').update(buf).digest('hex');
 }

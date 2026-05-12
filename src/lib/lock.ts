@@ -1,70 +1,89 @@
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
-import { lockPath, ensureCompassDir } from './state.ts';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 
-interface LockFile {
+export const LOCK_STALE_MS = 10 * 60 * 1000;
+
+export interface LockHolder {
   pid: number;
   started_at: string;
 }
 
-const STALE_MS = 10 * 60 * 1000;
+export interface AcquireResult {
+  acquired: boolean;
+  holder?: LockHolder;
+  reason?: string;
+}
+
+function ensureDir(path: string) {
+  const d = dirname(path);
+  if (!existsSync(d)) mkdirSync(d, { recursive: true });
+}
 
 function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
+    // EPERM means a process exists we can't signal — still alive.
     return e.code === 'EPERM';
   }
 }
 
-export function readLock(root: string): LockFile | null {
-  const p = lockPath(root);
-  if (!existsSync(p)) return null;
+function readHolder(lockPath: string): LockHolder | null {
+  if (!existsSync(lockPath)) return null;
   try {
-    return JSON.parse(readFileSync(p, 'utf8')) as LockFile;
+    const parsed = JSON.parse(readFileSync(lockPath, 'utf8'));
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof parsed.pid === 'number' &&
+      Number.isInteger(parsed.pid) &&
+      parsed.pid > 0 &&
+      typeof parsed.started_at === 'string' &&
+      parsed.started_at.length > 0 &&
+      !Number.isNaN(Date.parse(parsed.started_at))
+    ) {
+      return { pid: parsed.pid, started_at: parsed.started_at };
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-export class CompassLockError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'CompassLockError';
-  }
+export function isLockStale(holder: LockHolder): boolean {
+  if (!isPidAlive(holder.pid)) return true;
+  const age = Date.now() - new Date(holder.started_at).getTime();
+  return age >= LOCK_STALE_MS;
 }
 
-export function acquireLock(root: string): LockFile {
-  ensureCompassDir(root);
-  const p = lockPath(root);
-  const existing = readLock(root);
-  if (existing) {
-    const age = Date.now() - new Date(existing.started_at).getTime();
-    if (isPidAlive(existing.pid) && age < STALE_MS) {
-      throw new CompassLockError(
-        `another compass run in progress (pid ${existing.pid}, started ${existing.started_at})`,
-      );
-    }
-    // Stale or dead — take over.
+export function acquireLock(lockPath: string): AcquireResult {
+  ensureDir(lockPath);
+  const existing = readHolder(lockPath);
+  if (existing && !isLockStale(existing)) {
+    return {
+      acquired: false,
+      reason: `another compass run in progress (pid ${existing.pid}, started_at ${existing.started_at}) — already held by a live PID`,
+    };
   }
-  const lock: LockFile = { pid: process.pid, started_at: new Date().toISOString() };
-  writeFileSync(p, JSON.stringify(lock, null, 2));
-  return lock;
+  const holder: LockHolder = { pid: process.pid, started_at: new Date().toISOString() };
+  writeFileSync(lockPath, JSON.stringify(holder, null, 2));
+  return { acquired: true, holder };
 }
 
-export function releaseLock(root: string) {
-  const p = lockPath(root);
-  if (existsSync(p)) {
-    try {
-      unlinkSync(p);
-    } catch {
-      // ignore
-    }
+export function releaseLock(lockPath: string): void {
+  if (!existsSync(lockPath)) return;
+  const holder = readHolder(lockPath);
+  if (holder && holder.pid !== process.pid) {
+    throw new Error(
+      `releaseLock: not our lock (held by pid ${holder.pid}, we are ${process.pid}) — foreign lock, refusing to clobber`,
+    );
   }
-}
-
-export function isLockStale(lock: LockFile): boolean {
-  const age = Date.now() - new Date(lock.started_at).getTime();
-  return !isPidAlive(lock.pid) || age >= STALE_MS;
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    // ignore
+  }
 }

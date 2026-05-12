@@ -7,29 +7,36 @@ export function buildExpressTiny(): TmpRepo {
   const r = makeTmpRepo('compass-fx-express-');
   r.write('package.json', JSON.stringify({ name: 'express-tiny', version: '0.0.0' }, null, 2));
   r.write('tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['src/*'] } } }, null, 2));
+  r.write('.compassignore', `node_modules/\ndist/\n*.test.ts\n`);
 
-  // API layer (C1) — imports from services
+  // API layer (C1)
   r.write('src/api/users.ts', `
-import { Router } from 'express';
-import { UserService } from '../services/user';
-import { authMiddleware } from '../middleware/auth';
-
-export const userRouter = Router();
-userRouter.get('/', authMiddleware, async (req, res) => {
-  const svc = new UserService();
-  res.json(await svc.list());
-});
+import { UserService } from '../services/user.js';
+import { authMiddleware } from '../utils/auth.js';
+export const userRoutes = {
+  list: async () => { authMiddleware(); return new UserService().list(); },
+};
 `);
-  r.write('src/middleware/auth.ts', `
-export function authMiddleware(req: any, res: any, next: any) { next(); }
+  r.write('src/api/billing.ts', `
+import { BillingService } from '../services/billing.js';
+export const billingRoutes = {
+  charge: (amt: number) => new BillingService().charge(amt),
+};
 `);
 
-  // Services (C2) — imports from repositories
+  // Services (C2)
   r.write('src/services/user.ts', `
-import { UserRepo } from '../repositories/user';
+import { UserRepo } from '../repositories/user.js';
 export class UserService {
   private repo = new UserRepo();
   list() { return this.repo.findAll(); }
+}
+`);
+  r.write('src/services/billing.ts', `
+import { BillingRepo } from '../repositories/billing.js';
+export class BillingService {
+  private repo = new BillingRepo();
+  charge(amt: number) { return this.repo.record(amt); }
 }
 `);
 
@@ -39,8 +46,17 @@ export class UserRepo {
   async findAll() { return []; }
 }
 `);
+  r.write('src/repositories/billing.ts', `
+export class BillingRepo {
+  async record(amt: number) { return { amt }; }
+}
+`);
 
-  // Utils (C4) — leaf
+  // Utils (C4)
+  r.write('src/utils/auth.ts', `
+import { log } from './logger.js';
+export function authMiddleware() { log('auth'); }
+`);
   r.write('src/utils/logger.ts', `export const log = (s: string) => console.log(s);`);
   return r;
 }

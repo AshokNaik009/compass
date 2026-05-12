@@ -1,83 +1,48 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { StateSchema, type State, type Phase, LOUVAIN_PKG } from '../schema/state.ts';
+import { LOUVAIN_PKG, PhaseSchema, StateSchema, type Phase, type State } from '../schema/state.ts';
 
-export const COMPASS_DIR = '.compass';
-export const STATE_PATH = join(COMPASS_DIR, 'state.json');
-export const ANALYSIS_PATH = join(COMPASS_DIR, 'analysis.json');
-export const LOCK_PATH = join(COMPASS_DIR, '.lock');
-export const STATE_BROKEN_PATH = join(COMPASS_DIR, 'state.broken.json');
-
-export function ensureCompassDir(root: string) {
-  const dir = join(root, COMPASS_DIR);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  return dir;
+export interface DefaultStateOpts {
+  root: string;
+  depth?: 1 | 2;
 }
 
-export function statePath(root: string) {
-  return join(root, STATE_PATH);
+export interface TransitionOpts {
+  now?: () => Date;
+  error?: string;
 }
 
-export function analysisPath(root: string) {
-  return join(root, ANALYSIS_PATH);
-}
+const CANONICAL_ORDER: Phase[] = [
+  'walking',
+  'parsing',
+  'clustering',
+  'proposing',
+  'critiquing',
+  'rendering',
+  'done',
+];
 
-export function lockPath(root: string) {
-  return join(root, LOCK_PATH);
-}
-
-export function loadState(root: string): State {
-  const p = statePath(root);
-  if (!existsSync(p)) throw new Error(`no compass state found at ${p}`);
-  const raw = JSON.parse(readFileSync(p, 'utf8'));
-  const parsed = StateSchema.safeParse(raw);
-  if (!parsed.success) {
-    // Archive the broken state so the user can inspect.
-    const broken = join(root, STATE_BROKEN_PATH);
-    writeFileSync(broken, JSON.stringify(raw, null, 2));
-    throw new Error(
-      `state.json failed schema validation, archived to ${broken}: ${parsed.error.message}`,
-    );
-  }
-  return parsed.data;
-}
-
-export function loadStateOrNull(root: string): State | null {
-  try {
-    return loadState(root);
-  } catch {
-    return null;
-  }
-}
-
-export function saveState(root: string, state: State) {
-  ensureCompassDir(root);
-  const p = statePath(root);
-  const tmp = `${p}.tmp`;
-  const parsed = StateSchema.parse(state); // throws on invalid
-  writeFileSync(tmp, JSON.stringify(parsed, null, 2));
-  renameSync(tmp, p); // atomic on POSIX
+function isCanonical(p: Phase): boolean {
+  return CANONICAL_ORDER.includes(p);
 }
 
 export function projectSeed(root: string): string {
   return createHash('sha256').update(root).digest('hex').slice(0, 8);
 }
 
-export function initialState(root: string, depth: number): State {
+export function defaultState({ root, depth = 1 }: DefaultStateOpts): State {
   return {
     schema_version: 1,
     last_run_id: null,
     last_run_at: null,
     last_commit_sha: null,
-    depth: Math.max(1, Math.min(2, depth)) as 1 | 2,
+    depth,
     phase: 'walking',
     phase_started_at: new Date().toISOString(),
     last_error: null,
     lock_holder: null,
     files: {},
-    pre_clusters: [],
-    import_edges: [],
     pins: {
       louvain_pkg: LOUVAIN_PKG,
       louvain_seed: projectSeed(root),
@@ -96,25 +61,91 @@ export function initialState(root: string, depth: number): State {
   };
 }
 
-export function setPhase(state: State, phase: Phase, error?: string | null): State {
+function ensureDir(path: string) {
+  const dir = dirname(path);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+}
+
+function archiveBroken(statePath: string, raw: string) {
+  ensureDir(statePath);
+  const broken = join(dirname(statePath), 'state.broken.json');
+  writeFileSync(broken, raw);
+}
+
+export function loadState(statePath: string): State | null {
+  if (!existsSync(statePath)) return null;
+  const raw = readFileSync(statePath, 'utf8');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    archiveBroken(statePath, raw);
+    return null;
+  }
+  const result = StateSchema.safeParse(parsed);
+  if (!result.success) {
+    archiveBroken(statePath, raw);
+    return null;
+  }
+  return result.data;
+}
+
+export function saveState(statePath: string, state: State): void {
+  // zod throws if invalid — before any disk touch.
+  const validated = StateSchema.parse(state);
+  ensureDir(statePath);
+  const tmp = `${statePath}.tmp`;
+  writeFileSync(tmp, JSON.stringify(validated, null, 2));
+  renameSync(tmp, statePath);
+}
+
+export function transitionPhase(state: State, next: Phase, opts: TransitionOpts = {}): State {
+  PhaseSchema.parse(next);
+
+  if (next === 'failed') {
+    if (!opts.error || opts.error.length === 0) {
+      throw new Error('transitionPhase: phase=failed requires opts.error (last_error must be non-empty)');
+    }
+  }
+
+  // Forbid the canonical-order backward jump that the spec singles out:
+  // done → walking is a reset, which must be explicit (caller writes a fresh state).
+  if (isCanonical(state.phase) && isCanonical(next)) {
+    const from = CANONICAL_ORDER.indexOf(state.phase);
+    const to = CANONICAL_ORDER.indexOf(next);
+    if (state.phase === 'done' && next !== 'done') {
+      throw new Error(`transitionPhase: refusing backward transition from done → ${next}; reset state explicitly`);
+    }
+    if (from > to && state.phase !== 'failed') {
+      throw new Error(`transitionPhase: refusing backward transition from ${state.phase} → ${next}; reset state explicitly`);
+    }
+  }
+
+  const now = (opts.now ?? (() => new Date()))().toISOString();
   return {
     ...state,
-    phase,
-    phase_started_at: new Date().toISOString(),
-    last_error: phase === 'failed' ? error ?? state.last_error : null,
+    phase: next,
+    phase_started_at: now,
+    last_error: next === 'failed' ? (opts.error as string) : null,
   };
 }
 
-export function generateRunId(): string {
-  const d = new Date();
+// Bypass for /compass-recover: set phase without monotonic validation.
+export function forcePhase(state: State, next: Phase, opts: TransitionOpts = {}): State {
+  PhaseSchema.parse(next);
+  if (next === 'failed' && (!opts.error || opts.error.length === 0)) {
+    throw new Error('forcePhase: phase=failed requires opts.error');
+  }
+  const now = (opts.now ?? (() => new Date()))().toISOString();
+  return {
+    ...state,
+    phase: next,
+    phase_started_at: now,
+    last_error: next === 'failed' ? (opts.error as string) : null,
+  };
+}
+
+export function generateRunId(date: Date = new Date()): string {
   const pad = (n: number) => n.toString().padStart(2, '0');
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}-${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}`;
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}-${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}`;
 }
-
-export function relativeFromRoot(root: string, abs: string): string {
-  if (abs.startsWith(root + '/')) return abs.slice(root.length + 1);
-  return abs;
-}
-
-// Re-export helpers for scripts.
-export { dirname };
