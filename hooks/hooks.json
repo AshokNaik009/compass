@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PLUGIN_DIR/hooks/post-commit-refresh.sh\"",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

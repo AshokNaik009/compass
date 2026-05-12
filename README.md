@@ -108,6 +108,8 @@ Incremental update — re-analyzes only what changed since the last run. Much ch
 
 **When to use:** after every commit, or before a code review. Keep it in your workflow like `git status`.
 
+> **Auto-refresh via hook** — compass ships a `PostToolUse` hook that fires automatically whenever Claude Code runs a `git commit` via the Bash tool. The map stays current with zero discipline required. See [Auto-refresh hook](#auto-refresh-hook) below.
+
 ---
 
 ### `/compass-expand <component-id>`
@@ -161,6 +163,26 @@ Print a summary of all commands.
 ```
 /compass-help
 ```
+
+---
+
+## Auto-refresh hook
+
+compass ships a `PostToolUse` Claude Code hook (`hooks/hooks.json`) that fires automatically after every `git commit` run via the Bash tool inside Claude Code.
+
+**What it does:**
+
+1. Reads the bash command from Claude Code's hook payload
+2. Ignores anything that isn't a `git commit`
+3. Skips silently if `.compass/state.json` doesn't exist (repo not yet scanned)
+4. Classifies the diff as SAFE or UNSAFE (same logic as `/compass-refresh`)
+5. Runs only the minimum work needed — one critique call for SAFE, full re-cluster for UNSAFE
+
+**What this means for diagram rot:**
+
+The map updates itself. No `/compass-refresh` command, no post-commit git hook to configure, no CI job to wire up. Every commit Claude Code makes keeps `.compass/overview.md` current automatically.
+
+**Limitation:** the hook only fires for `git commit` commands run *through Claude Code's Bash tool*. Manual terminal commits outside Claude Code won't trigger it — run `/compass-refresh` manually for those.
 
 ---
 
